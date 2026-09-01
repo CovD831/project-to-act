@@ -559,6 +559,18 @@ class InitializerCliTests(unittest.TestCase):
             self.assertEqual(
                 {path.name for path in (root / ".project-to-act").iterdir()}, set(EXPECTED_CREATED)
             )
+            self.assertFalse((root / ".project-to-act.init.lock").exists())
+
+    def test_stale_initialization_lock_fails_closed(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            lock = root / module.INIT_LOCK_NAME
+            lock.write_text("pid=999999\n", encoding="utf-8")
+            with mock.patch.object(module, "INIT_LOCK_TIMEOUT_SECONDS", 0.0):
+                with self.assertRaisesRegex(OSError, "等待并发初始化超时"):
+                    module.initialize(root)
+            self.assertTrue(lock.is_file())
 
 
 if __name__ == "__main__":
