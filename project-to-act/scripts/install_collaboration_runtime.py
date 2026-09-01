@@ -25,6 +25,7 @@ RUNTIME_FILES = (
     "runtime_transaction.py",
     "task_runtime.py",
     "hook_adapter.py",
+    "codex_hook_adapter.py",
 )
 AGENTS_START = "<!-- project-to-act-runtime:start -->"
 AGENTS_END = "<!-- project-to-act-runtime:end -->"
@@ -65,6 +66,50 @@ jobs:
           python-version: "3.12"
       - run: python .project-to-act/bin/hook_adapter.py --project-root . --event ci
 """
+CODEX_HOOK_COMMAND = 'python "$(git rev-parse --show-toplevel)/.project-to-act/bin/codex_hook_adapter.py"'
+CODEX_HOOKS = {
+    "description": "Project-to-Act repository lifecycle adapter.",
+    "hooks": {
+        "SessionStart": [
+            {
+                "matcher": "startup|resume|clear|compact",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": CODEX_HOOK_COMMAND,
+                        "timeout": 10,
+                        "statusMessage": "Loading Project-to-Act task context",
+                        "additionalContextLimit": 8000,
+                    }
+                ],
+            }
+        ],
+        "Stop": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": CODEX_HOOK_COMMAND,
+                        "timeout": 10,
+                        "statusMessage": "Checking Project-to-Act task state",
+                    }
+                ]
+            }
+        ],
+        "SessionEnd": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": CODEX_HOOK_COMMAND,
+                        "timeout": 3,
+                    }
+                ],
+            }
+        ],
+    },
+}
+CODEX_HOOKS_BYTES = (json.dumps(CODEX_HOOKS, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
 
 
 def _read_json(path: Path, label: str) -> dict[str, Any]:
@@ -131,6 +176,7 @@ def install_runtime(
     dry_run: bool = False,
     activate_git_hook: bool = False,
     install_agents: bool = True,
+    install_codex_hook: bool = False,
 ) -> dict[str, Any]:
     root, management = _managed_root(project_root)
 
@@ -165,6 +211,12 @@ def install_runtime(
             agents_content = AGENTS_BLOCK.encode("utf-8")
         if agents_content is not None:
             mappings.append((agents_path, agents_content, agents_action))
+
+    codex_hook_action = "skipped"
+    codex_hook_path = root / ".codex" / "hooks.json"
+    if install_codex_hook:
+        codex_hook_action = "created"
+        mappings.append((codex_hook_path, CODEX_HOOKS_BYTES, codex_hook_action))
 
     conflicts = []
     unchanged = []
@@ -215,13 +267,14 @@ def install_runtime(
         "createdOrUpdated": created_or_updated,
         "unchanged": sorted(set(unchanged)),
         "agentsAction": agents_action,
+        "codexHookAction": "unchanged" if codex_hook_path.relative_to(root).as_posix() in unchanged else codex_hook_action,
         "configCreated": config_created,
         "gitHookActive": git_hook_active,
         "gitHookActivation": None if git_hook_active else "git config core.hooksPath .project-to-act/hooks",
     }
 
 
-def doctor_runtime(project_root: Path, *, check_agents: bool = True) -> dict[str, Any]:
+def doctor_runtime(project_root: Path, *, check_agents: bool = True, check_codex_hook: bool = False) -> dict[str, Any]:
     root, management = _managed_root(project_root)
     issues = []
     for target, expected in _static_mappings(root, management):
@@ -251,6 +304,15 @@ def doctor_runtime(project_root: Path, *, check_agents: bool = True) -> dict[str
                     agents_status = "valid"
             except (UnicodeDecodeError, RuntimeFailure):
                 issues.append("invalid-marker:AGENTS.md")
+    codex_hook_status = "skipped"
+    if check_codex_hook:
+        codex_hook_path = root / ".codex" / "hooks.json"
+        if codex_hook_path.is_symlink() or not codex_hook_path.is_file():
+            issues.append("missing-or-unsafe:.codex/hooks.json")
+        elif codex_hook_path.read_bytes() != CODEX_HOOKS_BYTES:
+            issues.append("content-mismatch:.codex/hooks.json")
+        else:
+            codex_hook_status = "valid"
     hook_path = management / "hooks" / "pre-commit"
     if hook_path.is_file() and not os.access(hook_path, os.X_OK):
         issues.append("not-executable:.project-to-act/hooks/pre-commit")
@@ -258,7 +320,13 @@ def doctor_runtime(project_root: Path, *, check_agents: bool = True) -> dict[str
     git_hook_active = current.returncode == 0 and current.stdout.strip() == ".project-to-act/hooks"
     if issues:
         raise RuntimeFailure("INSTALL_CONFLICT", f"Collaboration runtime doctor found issues: {issues}", "Repair or explicitly reinstall the listed artifacts.")
-    return {"schemaVersion": 1, "valid": True, "agentsStatus": agents_status, "gitHookActive": git_hook_active}
+    return {
+        "schemaVersion": 1,
+        "valid": True,
+        "agentsStatus": agents_status,
+        "codexHookStatus": codex_hook_status,
+        "gitHookActive": git_hook_active,
+    }
 
 
 def uninstall_runtime(
@@ -318,6 +386,17 @@ def uninstall_runtime(
     elif agents_path.exists():
         preserved.append("AGENTS.md")
 
+    codex_hook_path = root / ".codex" / "hooks.json"
+    if codex_hook_path.exists():
+        if codex_hook_path.is_symlink() or not codex_hook_path.is_file():
+            conflicts.append(".codex/hooks.json")
+        elif codex_hook_path.read_bytes() == CODEX_HOOKS_BYTES:
+            deletes.append(codex_hook_path)
+        elif "codex_hook_adapter.py" in codex_hook_path.read_text(encoding="utf-8", errors="ignore"):
+            conflicts.append(".codex/hooks.json")
+        else:
+            preserved.append(".codex/hooks.json")
+
     if conflicts:
         raise RuntimeFailure("INSTALL_CONFLICT", f"Uninstall would remove locally modified artifacts: {sorted(set(conflicts))}", "Restore the installed content or remove the listed artifacts manually; no files were changed.")
 
@@ -346,7 +425,7 @@ def uninstall_runtime(
                         "Restore core.hooksPath=.project-to-act/hooks manually, then run doctor.",
                     ) from error
             raise
-        for directory in (management / "bin", management / "hooks", root / ".github/workflows", root / ".github"):
+        for directory in (management / "bin", management / "hooks", root / ".codex", root / ".github/workflows", root / ".github"):
             try:
                 directory.rmdir()
             except OSError:
@@ -368,6 +447,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--activate-git-hook", action="store_true")
     parser.add_argument("--skip-agents", action="store_true")
+    parser.add_argument("--install-codex-hook", action="store_true")
+    parser.add_argument("--doctor-codex-hook", action="store_true")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--doctor", action="store_true")
     mode.add_argument("--uninstall", action="store_true")
@@ -378,19 +459,22 @@ def main(argv: list[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
         if args.doctor:
-            if args.dry_run or args.activate_git_hook:
+            if args.dry_run or args.activate_git_hook or args.install_codex_hook:
                 raise RuntimeFailure("INSTALL_CONFLICT", "--doctor cannot be combined with --dry-run or --activate-git-hook", "Run doctor as a read-only standalone mode.", 2)
-            result = doctor_runtime(args.project_root, check_agents=not args.skip_agents)
+            result = doctor_runtime(args.project_root, check_agents=not args.skip_agents, check_codex_hook=args.doctor_codex_hook)
         elif args.uninstall:
-            if args.activate_git_hook:
+            if args.activate_git_hook or args.install_codex_hook or args.doctor_codex_hook:
                 raise RuntimeFailure("INSTALL_CONFLICT", "--uninstall cannot be combined with --activate-git-hook", "Run uninstall without hook activation.", 2)
             result = uninstall_runtime(args.project_root, dry_run=args.dry_run, uninstall_agents=not args.skip_agents)
         else:
+            if args.doctor_codex_hook:
+                raise RuntimeFailure("INSTALL_CONFLICT", "--doctor-codex-hook requires --doctor", "Run --doctor --doctor-codex-hook together.", 2)
             result = install_runtime(
                 args.project_root,
                 dry_run=args.dry_run,
                 activate_git_hook=args.activate_git_hook,
                 install_agents=not args.skip_agents,
+                install_codex_hook=args.install_codex_hook,
             )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0

@@ -70,7 +70,7 @@ MVP-A 的 role preview 只校验方向、core state 和 payload；它不生成 h
 
 只在开发或评测 canonical 写路径时读取 [references/runtime-contract.md](references/runtime-contract.md)。候选 runtime 默认关闭，只允许在仓库显式开启的评测/试点中使用 Builder→Verifier 单一闭环；不自动 commit、push 或写 legacy task。
 
-当用户明确要求在仓库安装跨 Agent collaboration runtime 时，先使用 `install_collaboration_runtime.py --dry-run`。安装器必须无覆盖，默认不激活 Git hook，也不开启 experimental writer；只有明确请求时才使用 `--activate-git-hook`。诊断使用 `--doctor`；卸载先运行 `--uninstall --dry-run`，再显式运行 `--uninstall`。doctor 与卸载都必须保留本地修改并对内容冲突 fail-closed。
+当用户明确要求在仓库安装跨 Agent collaboration runtime 时，先使用 `install_collaboration_runtime.py --dry-run`。安装器必须无覆盖，默认不激活 Git hook、不开启 experimental writer、也不安装厂商 Hook；只有明确请求时才使用 `--activate-git-hook` 或 `--install-codex-hook`。Codex 项目 Hook 需要仓库信任与 `/hooks` review；已有不同 `.codex/hooks.json` 时停止并要求显式合并。诊断使用 `--doctor`，Codex Hook 追加 `--doctor-codex-hook`；卸载先运行 `--uninstall --dry-run`，再显式运行 `--uninstall`。doctor 与卸载都必须保留本地修改并对内容冲突 fail-closed。
 
 ## 更新协议
 

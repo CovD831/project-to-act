@@ -15,7 +15,8 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from hook_adapter import handle_event
-from install_collaboration_runtime import doctor_runtime, install_runtime, uninstall_runtime
+from codex_hook_adapter import adapt_codex_event
+from install_collaboration_runtime import CODEX_HOOK_COMMAND, doctor_runtime, install_runtime, uninstall_runtime
 from runtime_transaction import FileTransaction
 import task_runtime as runtime
 from task_runtime import RuntimeFailure, discover_task
@@ -84,6 +85,63 @@ class RuntimeAdapterInstallTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["taskId"], "TASK-001")
+
+            codex_adapter = root / ".project-to-act/bin/codex_hook_adapter.py"
+            codex = subprocess.run(
+                [sys.executable, str(codex_adapter)],
+                cwd=root,
+                input=json.dumps({"hook_event_name": "SessionStart", "cwd": str(root), "session_id": "s-1"}),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+                env={**os.environ, "PYTHONPATH": ""},
+            )
+            self.assertEqual(codex.returncode, 0, codex.stderr)
+            self.assertEqual(json.loads(codex.stdout)["hookSpecificOutput"]["hookEventName"], "SessionStart")
+
+    def test_codex_adapter_maps_official_lifecycle_payloads_without_semantic_writes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            make_repository(root)
+            start = adapt_codex_event({"hook_event_name": "SessionStart", "cwd": str(root), "session_id": "s-1"})
+            self.assertEqual(start["hookSpecificOutput"]["hookEventName"], "SessionStart")
+            self.assertIn("TASK-001", start["hookSpecificOutput"]["additionalContext"])
+
+            dirty = root / "src/other.txt"
+            dirty.write_text("work in progress\n", encoding="utf-8")
+            stop = adapt_codex_event({"hook_event_name": "Stop", "cwd": str(root), "stop_hook_active": False})
+            self.assertTrue(stop["continue"])
+            self.assertIn("SEMANTIC", stop["systemMessage"].upper())
+            self.assertFalse((root / ".project-to-act/tasks/TASK-001/HANDOFF.json").exists())
+            self.assertIsNone(adapt_codex_event({"hook_event_name": "SessionEnd", "cwd": str(root), "reason": "clear"}))
+
+    def test_codex_hook_install_is_explicit_and_existing_config_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            managed_repository(root)
+            install_runtime(root)
+            self.assertFalse((root / ".codex/hooks.json").exists())
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            managed_repository(root)
+            installed = install_runtime(root, install_codex_hook=True)
+            hooks_path = root / ".codex/hooks.json"
+            self.assertEqual(installed["codexHookAction"], "created")
+            hooks = json.loads(hooks_path.read_text(encoding="utf-8"))
+            self.assertEqual(hooks["hooks"]["Stop"][0]["hooks"][0]["command"], CODEX_HOOK_COMMAND)
+            self.assertEqual(doctor_runtime(root, check_codex_hook=True)["codexHookStatus"], "valid")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            managed_repository(root)
+            hooks_path = root / ".codex/hooks.json"
+            write_json(hooks_path, {"hooks": {"Stop": []}})
+            with self.assertRaises(RuntimeFailure) as conflict:
+                install_runtime(root, install_codex_hook=True)
+            self.assertEqual(conflict.exception.code, "INSTALL_CONFLICT")
+            self.assertFalse((root / ".project-to-act/bin").exists())
 
     def test_pre_commit_validates_staged_intent_and_stop_only_discloses(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -232,10 +290,11 @@ class RuntimeAdapterInstallTests(unittest.TestCase):
             managed_repository(root)
             agents_path = root / "AGENTS.md"
             agents_path.write_text("# Existing repository guidance\n", encoding="utf-8")
-            install_runtime(root, activate_git_hook=True)
-            diagnosis = doctor_runtime(root)
+            install_runtime(root, activate_git_hook=True, install_codex_hook=True)
+            diagnosis = doctor_runtime(root, check_codex_hook=True)
             self.assertTrue(diagnosis["valid"])
             self.assertTrue(diagnosis["gitHookActive"])
+            self.assertEqual(diagnosis["codexHookStatus"], "valid")
 
             config_path = root / ".project-to-act/COLLABORATION_CONFIG.json"
             write_json(config_path, {"schemaVersion": 1, "experimentalHandoffWrites": True})
@@ -249,6 +308,7 @@ class RuntimeAdapterInstallTests(unittest.TestCase):
             self.assertFalse((root / ".project-to-act/bin").exists())
             self.assertFalse((root / ".project-to-act/hooks").exists())
             self.assertFalse((root / ".github/workflows/project-to-act.yml").exists())
+            self.assertFalse((root / ".codex/hooks.json").exists())
             self.assertTrue(config_path.exists())
             self.assertEqual(agents_path.read_text(encoding="utf-8"), "# Existing repository guidance")
             hook_config = subprocess.run(
