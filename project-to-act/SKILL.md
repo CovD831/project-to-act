@@ -70,6 +70,8 @@ MVP-A 的 role preview 只校验方向、core state 和 payload；它不生成 h
 
 只在开发或评测 canonical 写路径时读取 [references/runtime-contract.md](references/runtime-contract.md)。候选 runtime 默认关闭，只允许在仓库显式开启的评测/试点中使用 Builder→Verifier 单一闭环；不自动 commit、push 或写 legacy task。
 
+当用户明确要求在仓库安装或升级跨 Agent collaboration runtime 时，先使用 `install_collaboration_runtime.py --dry-run`。安装器必须无覆盖，默认不激活 Git hook，也不开启 experimental writer；只有明确请求时才使用 `--activate-git-hook`。
+
 ## 更新协议
 
 1. 开工前比较请求与目标、非目标、范围和验收标准。实质冲突时指出影响，获得确认后先记录路线变化再实施。

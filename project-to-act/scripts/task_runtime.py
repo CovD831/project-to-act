@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -12,6 +13,7 @@ import subprocess
 import sys
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator
 from uuid import uuid4
@@ -33,6 +35,7 @@ MAX_SUMMARY_LENGTH = 4000
 MAX_NEXT_ACTION_LENGTH = 2000
 MAX_TASKS_SCANNED = 256
 MAX_INTENT_ITEMS = 256
+MAX_STAGED_PATHS = 4096
 ACTIVE_STATES = {"ready", "in_progress", "blocked", "review"}
 
 
@@ -140,11 +143,22 @@ def _identity(value: str, label: str) -> str:
     return normalized
 
 
+def _current_branch(root: Path) -> str:
+    branch = _git_value(root, "branch", "--show-current")
+    if branch:
+        return branch
+    for name in ("GITHUB_HEAD_REF", "GITHUB_REF_NAME", "CI_COMMIT_REF_NAME"):
+        candidate = os.environ.get(name, "").strip()
+        if candidate:
+            return _identity(candidate, name)
+    raise RuntimeFailure("BRANCH_MISMATCH", "Git is in detached HEAD and no supported CI branch variable is available", "Pass an explicit task in a branch-aware checkout.")
+
+
 def _require_branch(root: Path, status: dict[str, Any], expected: str | None = None) -> str:
     branch = expected or status.get("branch")
     if not isinstance(branch, str) or not branch.strip():
         raise RuntimeFailure("BRANCH_MISMATCH", "STATUS.branch is missing", "Assign one canonical task branch.")
-    actual = _git_value(root, "branch", "--show-current")
+    actual = _current_branch(root)
     if actual != branch:
         raise RuntimeFailure("BRANCH_MISMATCH", f"Current branch {actual!r} does not match task branch {branch!r}", "Switch to the canonical task branch.")
     return branch
@@ -236,6 +250,99 @@ def _require_no_intent_conflicts(root: Path, task_id: str) -> None:
     conflicts = _intent_conflicts(root, task_id)
     if conflicts:
         raise RuntimeFailure("INTENT_CONFLICT", f"Task intent conflicts: {json.dumps(conflicts, ensure_ascii=False)}", "Resolve path/symbol/contract/migration ownership before handoff.")
+
+
+def discover_task(root: Path, task_id: str | None = None) -> str:
+    root = root.expanduser().resolve()
+    if task_id:
+        _load_status(root, task_id)
+        return task_id
+    branch = _current_branch(root)
+    task_store = root / ".project-to-act" / "tasks"
+    if not task_store.is_dir() or task_store.is_symlink():
+        raise RuntimeFailure("PROVIDER_NOT_FOUND", "No target task store is available", "Pass --task-id or initialize a canonical target task.", 3)
+    matches = []
+    directories = sorted(path for path in task_store.iterdir() if path.is_dir() and not path.is_symlink())
+    if len(directories) > MAX_TASKS_SCANNED:
+        raise RuntimeFailure("CANONICAL_SOURCE_CONFLICT", f"Task store exceeds {MAX_TASKS_SCANNED} discoverable tasks", "Pass an explicit --task-id.", 3)
+    for directory in directories:
+        _, status = _load_status(root, directory.name)
+        if status.get("state") in ACTIVE_STATES and status.get("branch") == branch:
+            matches.append(directory.name)
+    if not matches:
+        raise RuntimeFailure("PROVIDER_NOT_FOUND", f"No active task matches Git branch {branch!r}", "Pass an explicit --task-id or assign STATUS.branch.", 3)
+    if len(matches) > 1:
+        raise RuntimeFailure("CANONICAL_SOURCE_CONFLICT", f"Multiple active tasks match branch {branch!r}: {matches}", "Pass an explicit --task-id and resolve branch ownership.", 3)
+    return matches[0]
+
+
+def _intent_matches(path: str, patterns: list[str]) -> bool:
+    normalized = path.replace("\\", "/")
+    for pattern in patterns:
+        if re.search(r"[?*\[]", pattern):
+            path_parts = tuple(normalized.split("/"))
+            pattern_parts = tuple(pattern.split("/"))
+
+            @lru_cache(maxsize=None)
+            def matches(path_index: int, pattern_index: int) -> bool:
+                if pattern_index == len(pattern_parts):
+                    return path_index == len(path_parts)
+                segment = pattern_parts[pattern_index]
+                if segment == "**":
+                    return matches(path_index, pattern_index + 1) or (
+                        path_index < len(path_parts) and matches(path_index + 1, pattern_index)
+                    )
+                return (
+                    path_index < len(path_parts)
+                    and fnmatch.fnmatchcase(path_parts[path_index], segment)
+                    and matches(path_index + 1, pattern_index + 1)
+                )
+
+            if matches(0, 0):
+                return True
+            continue
+        if normalized == pattern or normalized.startswith(f"{pattern}/"):
+            return True
+    return False
+
+
+def validate_task(root: Path, task_id: str, *, staged: bool = False) -> dict[str, Any]:
+    root = root.expanduser().resolve()
+    paths, status = _load_status(root, task_id)
+    _require_branch(root, status)
+    _check_context(root, task_id, paths, status)
+    _require_no_intent_conflicts(root, task_id)
+    view = canonical_view(root, task_id)
+    staged_paths: list[str] = []
+    if staged:
+        staged_paths = [line for line in _git_value(root, "diff", "--cached", "--name-only", "--").splitlines() if line]
+        if len(staged_paths) > MAX_STAGED_PATHS:
+            raise RuntimeFailure("INTENT_CONFLICT", f"Staged path set exceeds {MAX_STAGED_PATHS} files", "Split the commit before validating task intent.")
+        intent = _intent(root, task_id)
+        protocol_prefixes = (
+            f".project-to-act/tasks/{task_id}/",
+            ".project-to-act/runtime/",
+        )
+        outside = [
+            path
+            for path in staged_paths
+            if not path.replace("\\", "/").startswith(protocol_prefixes)
+            and not _intent_matches(path, intent["paths"])
+        ]
+        if outside:
+            raise RuntimeFailure("INTENT_CONFLICT", f"Staged paths are outside task intent: {outside}", "Update the approved INTENT.json or remove the staged paths.")
+    recovery = resume_task(root, task_id)
+    if not recovery["recoverable"]:
+        raise RuntimeFailure("HANDOFF_ANCHOR_MISMATCH", f"Task is not recoverable: {recovery['errors']}", "Repair the canonical handoff/session state before continuing.")
+    return {
+        "schemaVersion": 1,
+        "valid": True,
+        "taskId": task_id,
+        "staged": staged,
+        "stagedPaths": staged_paths,
+        "view": view,
+        "recovery": recovery,
+    }
 
 
 def _check_context(root: Path, task_id: str, paths: dict[str, Path], status: dict[str, Any]) -> dict[str, Any]:
@@ -607,6 +714,7 @@ def accept_handoff(
 def resume_task(root: Path, task_id: str) -> dict[str, Any]:
     root = root.expanduser().resolve()
     paths, status = _load_status(root, task_id)
+    _require_branch(root, status)
     view = canonical_view(root, task_id)
     errors = []
     handoff = None
@@ -628,7 +736,7 @@ def resume_task(root: Path, task_id: str) -> dict[str, Any]:
                 errors.append({"code": "HANDOFF_ANCHOR_MISMATCH", "message": "STATUS.contextHash does not match HANDOFF.json"})
             if handoff.get("state") != status.get("handoffState"):
                 errors.append({"code": "HANDOFF_ANCHOR_MISMATCH", "message": "STATUS.handoffState does not match HANDOFF.state"})
-            actual_branch = _git_value(root, "branch", "--show-current")
+            actual_branch = _current_branch(root)
             if handoff.get("branch") != status.get("branch") or handoff.get("branch") != actual_branch:
                 errors.append({"code": "BRANCH_MISMATCH", "message": "Current branch, STATUS.branch, and HANDOFF.branch do not match"})
             code_sha = handoff.get("codeSha")
@@ -711,7 +819,10 @@ def _parser() -> argparse.ArgumentParser:
     accept.add_argument("--actor", required=True)
     accept.add_argument("--executor", required=True)
     resume = commands.add_parser("resume")
-    resume.add_argument("task_id")
+    resume.add_argument("task_id", nargs="?")
+    validate = commands.add_parser("validate")
+    validate.add_argument("task_id", nargs="?")
+    validate.add_argument("--staged", action="store_true")
     return parser
 
 
@@ -733,11 +844,15 @@ def main(argv: list[str] | None = None) -> int:
             )
         elif args.command == "handoff" and args.handoff_command == "accept":
             result = accept_handoff(root, args.task_id, expected_revision=args.expected_revision, actor=args.actor, executor=args.executor)
-        else:
-            result = resume_task(root, args.task_id)
+        elif args.command == "resume":
+            selected_task = discover_task(root, args.task_id)
+            result = resume_task(root, selected_task)
             if not result["recoverable"]:
                 print(json.dumps(result, ensure_ascii=False, indent=2))
                 return 1
+        else:
+            selected_task = discover_task(root, args.task_id)
+            result = validate_task(root, selected_task, staged=args.staged)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except ContractError as error:

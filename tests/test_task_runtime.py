@@ -64,6 +64,10 @@ def make_repository(root: Path, *, writes_enabled: bool = True) -> None:
     source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
     task_dir = root / ".project-to-act" / "tasks" / "TASK-001"
     write_json(
+        root / ".project-to-act" / "PROJECT_CONFIG.json",
+        {"schema_version": 1, "mode": "managed"},
+    )
+    write_json(
         root / ".project-to-act" / "COLLABORATION_CONFIG.json",
         {"schemaVersion": 1, "experimentalHandoffWrites": writes_enabled},
     )
