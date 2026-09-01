@@ -1,6 +1,6 @@
 ---
 name: project-to-act
-description: Use for durable multi-session project work when `.project-to-act` already exists, when the user explicitly asks to initialize or adopt project management, or when a T3/T4 project needs persistent objectives, progress, decisions, versions, evidence, and acceptance gates. Do not initialize it for one-off edits, small disposable tasks, or projects that already have another ledger until a single canonical source is explicitly selected.
+description: Use for durable multi-session project work, repository-backed task bundles, or Lead/Builder/Verifier handoffs when `.project-to-act` exists or the user explicitly asks to adopt project management. Maintains one canonical project/task source, evidence, decisions, and acceptance gates. Do not initialize it for one-off edits or beside another ledger until one canonical source is selected.
 ---
 
 # Project to Act
@@ -59,6 +59,14 @@ python <Skill目录>/scripts/init_project_management.py --project-root <项目�
 先搜索规范账本中的“目标、范围、非目标、当前状态、下一决策点”等标题，只读命中段落；再按任务搜索“进度、功能、版本、证据、Gate、验收”等相关段落。仅在一致性审计时读取全文。
 
 文件变长时先搜索功能名、版本号、状态、证据 ID 或二级标题。文件数量少或内容“可能相关”不是全量读取理由。
+
+## 结构化任务与角色交接
+
+当 `.project-to-act/tasks/<ID>/` 存在时，task bundle 是该任务的唯一结构化事实源。读取、对比 legacy task 或准备迁移时，读取 [references/canonical-task-view.md](references/canonical-task-view.md) 并使用只读 `task_view.py`。不为了表面统一而丢弃 provider 来源或 gap。
+
+当请求涉及 Lead 派活、Builder 提交验证候选、Verifier 退回/推荐或架构升级时，读取 [references/role-handoffs.md](references/role-handoffs.md)。角色属于当前 task contract，不根据用户语气或 Agent 自述覆盖。
+
+MVP-A 的 role preview 只校验方向、core state 和 payload；它不生成 handoff ID，不写状态/event/evidence，也不代表接收方已接手。未经写路径 Gate 验证，不使用或自行补造 `handoff publish/accept`。
 
 ## 更新协议
 

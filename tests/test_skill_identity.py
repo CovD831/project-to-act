@@ -32,6 +32,14 @@ class SkillIdentityTests(unittest.TestCase):
             self.assertNotIn(LEGACY_SLUG, text, str(path))
             self.assertNotIn(LEGACY_TITLE, text, str(path))
 
+    def test_thin_team_handoff_fixture_is_test_only_and_owns_no_runtime(self):
+        fixture = REPO_ROOT / "tests" / "fixtures" / "team-handoff" / "SKILL.md"
+        self.assertTrue(fixture.is_file())
+        text = fixture.read_text(encoding="utf-8")
+        self.assertIn("Test-only", text)
+        self.assertIn("owns no schema, state, runtime, hook, event store, or writer", text)
+        self.assertFalse((REPO_ROOT / "project-to-act" / "team-handoff").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
