@@ -285,7 +285,7 @@ class InitializeProjectManagementTests(unittest.TestCase):
             root = Path(temp_dir)
             management = root / ".project-to-act"
             management.mkdir()
-            config = management / CONFIG_NAME
+            config = root.resolve() / ".project-to-act" / CONFIG_NAME
             original_is_symlink = Path.is_symlink
 
             def report_config_as_symlink(path):
@@ -299,7 +299,7 @@ class InitializeProjectManagementTests(unittest.TestCase):
         module = load_module()
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
-            ledger = root / "docs" / "project-ledger.md"
+            ledger = root.resolve() / "docs" / "project-ledger.md"
             original_is_symlink = Path.is_symlink
 
             def report_ledger_as_symlink(path):
@@ -398,7 +398,7 @@ class InitializeProjectManagementTests(unittest.TestCase):
             root = Path(temp_dir)
             management_dir = root / ".project-to-act"
             management_dir.mkdir()
-            collision = management_dir / "PROJECT_OVERVIEW.md"
+            collision = root.resolve() / ".project-to-act" / "PROJECT_OVERVIEW.md"
             original_is_symlink = Path.is_symlink
 
             def report_collision_as_symlink(path):
