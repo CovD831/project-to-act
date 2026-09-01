@@ -44,15 +44,18 @@ class FileTransaction:
     """Replace several repository files with rollback on any failed replace."""
 
     def __init__(self, root: Path, *, fail_after: int | None = None):
-        self.root = root
+        self.root = root.expanduser().resolve()
         self.fail_after = fail_after
-        self.changes: list[tuple[Path, bytes]] = []
+        self.changes: list[tuple[Path, bytes | None]] = []
 
     def add_json(self, path: Path, value: Any) -> None:
         self.changes.append((inside_project(self.root, path, "transaction target"), _json_bytes(value)))
 
     def add_text(self, path: Path, value: str) -> None:
         self.changes.append((inside_project(self.root, path, "transaction target"), value.encode("utf-8")))
+
+    def add_delete(self, path: Path) -> None:
+        self.changes.append((inside_project(self.root, path, "transaction target"), None))
 
     def commit(self) -> None:
         targets = [path for path, _ in self.changes]
@@ -75,15 +78,19 @@ class FileTransaction:
                     directory.mkdir()
                     created_directories.append(directory)
                 originals[target] = target.read_bytes() if target.exists() else None
-                temp = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
-                with temp.open("xb") as handle:
-                    handle.write(content)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                temporary[target] = temp
+                if content is not None:
+                    temp = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+                    with temp.open("xb") as handle:
+                        handle.write(content)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    temporary[target] = temp
 
-            for target, _ in self.changes:
-                os.replace(temporary[target], target)
+            for target, content in self.changes:
+                if content is None:
+                    target.unlink()
+                else:
+                    os.replace(temporary[target], target)
                 replaced.append(target)
                 if self.fail_after is not None and len(replaced) >= self.fail_after:
                     raise OSError(f"injected failure after {self.fail_after} replacements")

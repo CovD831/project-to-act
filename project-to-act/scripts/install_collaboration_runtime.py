@@ -83,6 +83,48 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, encoding="utf-8", check=False)
 
 
+def _managed_root(project_root: Path) -> tuple[Path, Path]:
+    root = project_root.expanduser().resolve()
+    management = root / ".project-to-act"
+    project_config = management / "PROJECT_CONFIG.json"
+    if not root.is_dir() or management.is_symlink() or not management.is_dir() or not project_config.is_file():
+        raise RuntimeFailure("PROVIDER_NOT_FOUND", "Project-to-Act management is not initialized", "Initialize or adopt Project-to-Act before managing collaboration runtime.", 3)
+    config = _read_json(project_config, "PROJECT_CONFIG.json")
+    if config.get("schema_version") != 1 or config.get("mode") not in {"managed", "external-ledger"}:
+        raise RuntimeFailure("INSTALL_CONFLICT", "Unsupported PROJECT_CONFIG.json", "Migrate the project management configuration first.")
+    return root, management
+
+
+def _static_mappings(root: Path, management: Path) -> list[tuple[Path, bytes]]:
+    mappings = []
+    for filename in RUNTIME_FILES:
+        source = SCRIPT_DIR / filename
+        if source.is_symlink() or not source.is_file():
+            raise RuntimeFailure("INSTALL_CONFLICT", f"Runtime source is missing: {source}", "Repair the Skill installation.")
+        mappings.append((management / "bin" / filename, source.read_bytes()))
+    mappings.extend(
+        [
+            (management / "hooks" / "pre-commit", PRE_COMMIT.encode("utf-8")),
+            (root / ".github" / "workflows" / "project-to-act.yml", WORKFLOW.encode("utf-8")),
+        ]
+    )
+    return mappings
+
+
+def _marker_span(content: str) -> tuple[int, int] | None:
+    start_count = content.count(AGENTS_START)
+    end_count = content.count(AGENTS_END)
+    if start_count != end_count or start_count > 1:
+        raise RuntimeFailure("INSTALL_CONFLICT", "AGENTS.md has an incomplete or duplicate Project-to-Act marker block", "Repair the marker block manually.")
+    if start_count == 0:
+        return None
+    start = content.index(AGENTS_START)
+    end = content.index(AGENTS_END, start) + len(AGENTS_END)
+    if content[start:end] != AGENTS_BLOCK.rstrip():
+        raise RuntimeFailure("INSTALL_CONFLICT", "AGENTS.md Project-to-Act marker block differs from this runtime", "Review and migrate the marker block explicitly; the installer will not overwrite it.")
+    return start, end
+
+
 def install_runtime(
     project_root: Path,
     *,
@@ -90,27 +132,10 @@ def install_runtime(
     activate_git_hook: bool = False,
     install_agents: bool = True,
 ) -> dict[str, Any]:
-    root = project_root.expanduser().resolve()
-    management = root / ".project-to-act"
-    project_config = management / "PROJECT_CONFIG.json"
-    if not root.is_dir() or management.is_symlink() or not management.is_dir() or not project_config.is_file():
-        raise RuntimeFailure("PROVIDER_NOT_FOUND", "Project-to-Act management is not initialized", "Initialize or adopt Project-to-Act before installing collaboration runtime.", 3)
-    config = _read_json(project_config, "PROJECT_CONFIG.json")
-    if config.get("schema_version") != 1 or config.get("mode") not in {"managed", "external-ledger"}:
-        raise RuntimeFailure("INSTALL_CONFLICT", "Unsupported PROJECT_CONFIG.json", "Migrate the project management configuration first.")
+    root, management = _managed_root(project_root)
 
     mappings: list[tuple[Path, bytes, str]] = []
-    for filename in RUNTIME_FILES:
-        source = SCRIPT_DIR / filename
-        if source.is_symlink() or not source.is_file():
-            raise RuntimeFailure("INSTALL_CONFLICT", f"Runtime source is missing: {source}", "Repair the Skill installation.")
-        mappings.append((management / "bin" / filename, source.read_bytes(), "created"))
-    mappings.extend(
-        [
-            (management / "hooks" / "pre-commit", PRE_COMMIT.encode("utf-8"), "created"),
-            (root / ".github" / "workflows" / "project-to-act.yml", WORKFLOW.encode("utf-8"), "created"),
-        ]
-    )
+    mappings.extend((target, content, "created") for target, content in _static_mappings(root, management))
 
     collaboration_config = management / "COLLABORATION_CONFIG.json"
     config_created = not collaboration_config.exists()
@@ -129,15 +154,8 @@ def install_runtime(
             if agents_path.is_symlink() or not agents_path.is_file():
                 raise RuntimeFailure("INSTALL_CONFLICT", "AGENTS.md is not a regular file", "Repair AGENTS.md before installing the fallback block.")
             existing_agents = agents_path.read_text(encoding="utf-8")
-            has_start = AGENTS_START in existing_agents
-            has_end = AGENTS_END in existing_agents
-            if has_start != has_end or existing_agents.count(AGENTS_START) != existing_agents.count(AGENTS_END):
-                raise RuntimeFailure("INSTALL_CONFLICT", "AGENTS.md has an incomplete Project-to-Act marker block", "Repair the marker block manually.")
-            if has_start:
-                start = existing_agents.index(AGENTS_START)
-                end = existing_agents.index(AGENTS_END, start) + len(AGENTS_END)
-                if existing_agents[start:end] != AGENTS_BLOCK.rstrip():
-                    raise RuntimeFailure("INSTALL_CONFLICT", "AGENTS.md Project-to-Act marker block differs from this runtime", "Review and migrate the marker block explicitly; the installer will not overwrite it.")
+            marker = _marker_span(existing_agents)
+            if marker is not None:
                 agents_action = "unchanged"
             else:
                 agents_action = "appended"
@@ -203,24 +221,177 @@ def install_runtime(
     }
 
 
+def doctor_runtime(project_root: Path, *, check_agents: bool = True) -> dict[str, Any]:
+    root, management = _managed_root(project_root)
+    issues = []
+    for target, expected in _static_mappings(root, management):
+        relative = target.relative_to(root).as_posix()
+        if target.is_symlink() or not target.is_file():
+            issues.append(f"missing-or-unsafe:{relative}")
+        elif target.read_bytes() != expected:
+            issues.append(f"content-mismatch:{relative}")
+    collaboration_config = management / "COLLABORATION_CONFIG.json"
+    try:
+        existing = _read_json(collaboration_config, "COLLABORATION_CONFIG.json")
+        if existing.get("schemaVersion") != 1 or not isinstance(existing.get("experimentalHandoffWrites"), bool):
+            issues.append("incompatible:.project-to-act/COLLABORATION_CONFIG.json")
+    except RuntimeFailure:
+        issues.append("missing-or-invalid:.project-to-act/COLLABORATION_CONFIG.json")
+    agents_status = "skipped"
+    if check_agents:
+        agents_path = root / "AGENTS.md"
+        if agents_path.is_symlink() or not agents_path.is_file():
+            issues.append("missing-or-unsafe:AGENTS.md")
+        else:
+            try:
+                marker = _marker_span(agents_path.read_text(encoding="utf-8"))
+                if marker is None:
+                    issues.append("missing-marker:AGENTS.md")
+                else:
+                    agents_status = "valid"
+            except (UnicodeDecodeError, RuntimeFailure):
+                issues.append("invalid-marker:AGENTS.md")
+    hook_path = management / "hooks" / "pre-commit"
+    if hook_path.is_file() and not os.access(hook_path, os.X_OK):
+        issues.append("not-executable:.project-to-act/hooks/pre-commit")
+    current = _git(root, "config", "--get", "core.hooksPath")
+    git_hook_active = current.returncode == 0 and current.stdout.strip() == ".project-to-act/hooks"
+    if issues:
+        raise RuntimeFailure("INSTALL_CONFLICT", f"Collaboration runtime doctor found issues: {issues}", "Repair or explicitly reinstall the listed artifacts.")
+    return {"schemaVersion": 1, "valid": True, "agentsStatus": agents_status, "gitHookActive": git_hook_active}
+
+
+def uninstall_runtime(
+    project_root: Path,
+    *,
+    dry_run: bool = False,
+    uninstall_agents: bool = True,
+) -> dict[str, Any]:
+    root, management = _managed_root(project_root)
+    deletes: list[Path] = []
+    rewrites: list[tuple[Path, str]] = []
+    preserved: list[str] = []
+    conflicts = []
+    for target, expected in _static_mappings(root, management):
+        relative = target.relative_to(root).as_posix()
+        if not target.exists():
+            continue
+        if target.is_symlink() or not target.is_file() or target.read_bytes() != expected:
+            conflicts.append(relative)
+        else:
+            deletes.append(target)
+
+    collaboration_config = management / "COLLABORATION_CONFIG.json"
+    if collaboration_config.exists():
+        existing = _read_json(collaboration_config, "COLLABORATION_CONFIG.json")
+        if existing == DEFAULT_CONFIG:
+            deletes.append(collaboration_config)
+        else:
+            preserved.append(collaboration_config.relative_to(root).as_posix())
+
+    agents_path = root / "AGENTS.md"
+    if uninstall_agents and agents_path.exists():
+        if agents_path.is_symlink() or not agents_path.is_file():
+            conflicts.append("AGENTS.md")
+        else:
+            try:
+                existing_agents = agents_path.read_text(encoding="utf-8")
+                marker = _marker_span(existing_agents)
+            except UnicodeDecodeError:
+                conflicts.append("AGENTS.md")
+            else:
+                if marker is None:
+                    preserved.append("AGENTS.md")
+                else:
+                    start, end = marker
+                    before = existing_agents[:start]
+                    after = existing_agents[end:]
+                    if before.endswith("\n\n"):
+                        before = before[:-2]
+                    if after.startswith("\n"):
+                        after = after[1:]
+                    remaining = before + after
+                    if remaining.strip():
+                        rewrites.append((agents_path, remaining))
+                    else:
+                        deletes.append(agents_path)
+    elif agents_path.exists():
+        preserved.append("AGENTS.md")
+
+    if conflicts:
+        raise RuntimeFailure("INSTALL_CONFLICT", f"Uninstall would remove locally modified artifacts: {sorted(set(conflicts))}", "Restore the installed content or remove the listed artifacts manually; no files were changed.")
+
+    current = _git(root, "config", "--get", "core.hooksPath")
+    git_hook_active = current.returncode == 0 and current.stdout.strip() == ".project-to-act/hooks"
+    if not dry_run:
+        if git_hook_active:
+            unset = _git(root, "config", "--unset", "core.hooksPath")
+            if unset.returncode != 0:
+                raise RuntimeFailure("GIT_FACT_UNAVAILABLE", unset.stderr.strip() or "Unable to unset core.hooksPath", "Deactivate the repository-local hook manually before retrying uninstall.")
+        transaction = FileTransaction(root)
+        for target, content in rewrites:
+            transaction.add_text(target, content)
+        for target in deletes:
+            transaction.add_delete(target)
+        try:
+            transaction.commit()
+        except RuntimeFailure as error:
+            if git_hook_active:
+                restored = _git(root, "config", "core.hooksPath", ".project-to-act/hooks")
+                if restored.returncode != 0:
+                    detail = restored.stderr.strip() or "Unable to restore core.hooksPath"
+                    raise RuntimeFailure(
+                        "PARTIAL_WRITE",
+                        f"File uninstall rolled back, but Git hook activation could not be restored: {detail}",
+                        "Restore core.hooksPath=.project-to-act/hooks manually, then run doctor.",
+                    ) from error
+            raise
+        for directory in (management / "bin", management / "hooks", root / ".github/workflows", root / ".github"):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+    return {
+        "schemaVersion": 1,
+        "valid": True,
+        "dryRun": dry_run,
+        "removed": sorted(path.relative_to(root).as_posix() for path in deletes),
+        "updated": sorted(path.relative_to(root).as_posix() for path, _ in rewrites),
+        "preserved": sorted(set(preserved)),
+        "gitHookDeactivated": git_hook_active and not dry_run,
+    }
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-root", type=Path, default=Path.cwd())
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--activate-git-hook", action="store_true")
     parser.add_argument("--skip-agents", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--doctor", action="store_true")
+    mode.add_argument("--uninstall", action="store_true")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
-        result = install_runtime(
-            args.project_root,
-            dry_run=args.dry_run,
-            activate_git_hook=args.activate_git_hook,
-            install_agents=not args.skip_agents,
-        )
+        if args.doctor:
+            if args.dry_run or args.activate_git_hook:
+                raise RuntimeFailure("INSTALL_CONFLICT", "--doctor cannot be combined with --dry-run or --activate-git-hook", "Run doctor as a read-only standalone mode.", 2)
+            result = doctor_runtime(args.project_root, check_agents=not args.skip_agents)
+        elif args.uninstall:
+            if args.activate_git_hook:
+                raise RuntimeFailure("INSTALL_CONFLICT", "--uninstall cannot be combined with --activate-git-hook", "Run uninstall without hook activation.", 2)
+            result = uninstall_runtime(args.project_root, dry_run=args.dry_run, uninstall_agents=not args.skip_agents)
+        else:
+            result = install_runtime(
+                args.project_root,
+                dry_run=args.dry_run,
+                activate_git_hook=args.activate_git_hook,
+                install_agents=not args.skip_agents,
+            )
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     except RuntimeFailure as error:

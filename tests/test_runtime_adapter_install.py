@@ -15,7 +15,8 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from hook_adapter import handle_event
-from install_collaboration_runtime import install_runtime
+from install_collaboration_runtime import doctor_runtime, install_runtime, uninstall_runtime
+from runtime_transaction import FileTransaction
 import task_runtime as runtime
 from task_runtime import RuntimeFailure, discover_task
 from tests.test_task_runtime import git, make_repository, write_json
@@ -224,6 +225,71 @@ class RuntimeAdapterInstallTests(unittest.TestCase):
             activated = install_runtime(root, activate_git_hook=True)
             self.assertTrue(activated["gitHookActive"])
             self.assertEqual(git(root, "config", "--get", "core.hooksPath"), ".project-to-act/hooks")
+
+    def test_doctor_and_controlled_uninstall(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            managed_repository(root)
+            agents_path = root / "AGENTS.md"
+            agents_path.write_text("# Existing repository guidance\n", encoding="utf-8")
+            install_runtime(root, activate_git_hook=True)
+            diagnosis = doctor_runtime(root)
+            self.assertTrue(diagnosis["valid"])
+            self.assertTrue(diagnosis["gitHookActive"])
+
+            config_path = root / ".project-to-act/COLLABORATION_CONFIG.json"
+            write_json(config_path, {"schemaVersion": 1, "experimentalHandoffWrites": True})
+            preview = uninstall_runtime(root, dry_run=True)
+            self.assertIn(".project-to-act/COLLABORATION_CONFIG.json", preview["preserved"])
+            self.assertTrue((root / ".project-to-act/bin/task_runtime.py").exists())
+            self.assertEqual(git(root, "config", "--get", "core.hooksPath"), ".project-to-act/hooks")
+
+            removed = uninstall_runtime(root)
+            self.assertTrue(removed["gitHookDeactivated"])
+            self.assertFalse((root / ".project-to-act/bin").exists())
+            self.assertFalse((root / ".project-to-act/hooks").exists())
+            self.assertFalse((root / ".github/workflows/project-to-act.yml").exists())
+            self.assertTrue(config_path.exists())
+            self.assertEqual(agents_path.read_text(encoding="utf-8"), "# Existing repository guidance")
+            hook_config = subprocess.run(
+                ["git", "config", "--get", "core.hooksPath"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+            )
+            self.assertNotEqual(hook_config.returncode, 0)
+
+    def test_uninstall_fails_before_deleting_modified_artifacts(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            managed_repository(root)
+            install_runtime(root)
+            adapter = root / ".project-to-act/bin/hook_adapter.py"
+            workflow = root / ".github/workflows/project-to-act.yml"
+            adapter.write_text("local customization\n", encoding="utf-8")
+            with self.assertRaises(RuntimeFailure) as conflict:
+                uninstall_runtime(root)
+            self.assertEqual(conflict.exception.code, "INSTALL_CONFLICT")
+            self.assertTrue(workflow.exists())
+            self.assertEqual(adapter.read_text(encoding="utf-8"), "local customization\n")
+
+    def test_delete_transaction_rolls_back_removed_files(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            first = root / "first.txt"
+            second = root / "second.txt"
+            first.write_text("first\n", encoding="utf-8")
+            second.write_text("second\n", encoding="utf-8")
+            transaction = FileTransaction(root, fail_after=1)
+            transaction.add_delete(first)
+            transaction.add_delete(second)
+            with self.assertRaises(RuntimeFailure) as failure:
+                transaction.commit()
+            self.assertEqual(failure.exception.code, "PARTIAL_WRITE")
+            self.assertEqual(first.read_text(encoding="utf-8"), "first\n")
+            self.assertEqual(second.read_text(encoding="utf-8"), "second\n")
 
 
 if __name__ == "__main__":
