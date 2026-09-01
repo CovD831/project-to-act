@@ -12,6 +12,7 @@ from typing import Any
 
 
 SCHEMA_VERSION = 1
+MAX_JSON_BYTES = 1024 * 1024
 TASK_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 CANONICAL_STATES = {"draft", "ready", "in_progress", "blocked", "review", "done", "cancelled"}
 
@@ -141,6 +142,8 @@ def _task_directory(root: Path, task_id: str) -> Path:
 def _read_json(path: Path, label: str) -> dict[str, Any]:
     if path.is_symlink() or not path.is_file():
         raise ContractError("TARGET_BUNDLE_INVALID", f"Missing regular file: {label}", "Restore the required task bundle file.")
+    if path.stat().st_size > MAX_JSON_BYTES:
+        raise ContractError("TARGET_BUNDLE_INVALID", f"JSON file exceeds {MAX_JSON_BYTES} bytes: {label}", "Reduce the source file to the supported contract size.")
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as error:

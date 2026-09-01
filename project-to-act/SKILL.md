@@ -68,6 +68,8 @@ python <Skill目录>/scripts/init_project_management.py --project-root <项目�
 
 MVP-A 的 role preview 只校验方向、core state 和 payload；它不生成 handoff ID，不写状态/event/evidence，也不代表接收方已接手。未经写路径 Gate 验证，不使用或自行补造 `handoff publish/accept`。
 
+只在开发或评测 canonical 写路径时读取 [references/runtime-contract.md](references/runtime-contract.md)。候选 runtime 默认关闭，只允许在仓库显式开启的评测/试点中使用 Builder→Verifier 单一闭环；不自动 commit、push 或写 legacy task。
+
 ## 更新协议
 
 1. 开工前比较请求与目标、非目标、范围和验收标准。实质冲突时指出影响，获得确认后先记录路线变化再实施。
