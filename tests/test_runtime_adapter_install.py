@@ -50,7 +50,8 @@ class RuntimeAdapterInstallTests(unittest.TestCase):
             for filename in ("task_view.py", "runtime_transaction.py", "task_runtime.py", "hook_adapter.py"):
                 self.assertTrue((root / ".project-to-act/bin" / filename).is_file())
             self.assertTrue((root / ".github/workflows/project-to-act.yml").is_file())
-            self.assertTrue((root / ".project-to-act/hooks/pre-commit").stat().st_mode & stat.S_IXUSR)
+            if os.name != "nt":
+                self.assertTrue((root / ".project-to-act/hooks/pre-commit").stat().st_mode & stat.S_IXUSR)
 
             second = install_runtime(root)
             self.assertEqual(second["createdOrUpdated"], [])
