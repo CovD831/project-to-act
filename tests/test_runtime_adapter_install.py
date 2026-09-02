@@ -86,6 +86,19 @@ class RuntimeAdapterInstallTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(json.loads(result.stdout)["taskId"], "TASK-001")
 
+            task_runtime = root / ".project-to-act/bin/task_runtime.py"
+            validated = subprocess.run(
+                [sys.executable, str(task_runtime), "--project-root", str(root), "validate", "TASK-001"],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+                env={**os.environ, "PYTHONPATH": ""},
+            )
+            self.assertEqual(validated.returncode, 0, validated.stderr)
+            self.assertTrue(json.loads(validated.stdout)["valid"])
+
             codex_adapter = root / ".project-to-act/bin/codex_hook_adapter.py"
             codex = subprocess.run(
                 [sys.executable, str(codex_adapter)],
@@ -99,6 +112,8 @@ class RuntimeAdapterInstallTests(unittest.TestCase):
             )
             self.assertEqual(codex.returncode, 0, codex.stderr)
             self.assertEqual(json.loads(codex.stdout)["hookSpecificOutput"]["hookEventName"], "SessionStart")
+            self.assertEqual(list((root / ".project-to-act/bin").rglob("__pycache__")), [])
+            self.assertEqual(list((root / ".project-to-act/bin").rglob("*.pyc")), [])
 
     def test_codex_adapter_maps_official_lifecycle_payloads_without_semantic_writes(self):
         with tempfile.TemporaryDirectory() as temp_dir:
